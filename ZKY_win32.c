@@ -75,6 +75,7 @@ static struct {
 	VkQueue graphics_queue;
 	VkQueue present_queue;
 	VkCommandPool graphics_command_pool;
+	VkSampleCountFlags sample_count;
 	VkRenderPass main_render_pass;
 
 	u8 current_frame;
@@ -87,6 +88,9 @@ static struct {
 	u8 resized;
 	VkSurfaceFormatKHR swapchain_format;
 	VkExtent2D swapchain_extent;
+	VkImage multisampled_color_image;
+	VkDeviceMemory multisampled_color_image_memory;
+	VkImageView multisampled_color_image_view;
 	VkSwapchainKHR swapchain;
 	u32 swapchain_image_count;
 #define MAX_SWAPCHAIN_IMAGES 16
@@ -127,6 +131,63 @@ static void swapchain_init(void) {
 		vk.swapchain_extent.width = g.screen_width;
 		vk.swapchain_extent.height = g.screen_height;
 	}
+
+	VkPhysicalDeviceMemoryProperties physical_device_memory_properties;
+	vkGetPhysicalDeviceMemoryProperties(vk.physical_device, &physical_device_memory_properties);
+
+	VK_CHECK(vkCreateImage(vk.device, &(VkImageCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = vk.swapchain_format.format,
+		.extent = (VkExtent3D) {
+			.width = vk.swapchain_extent.width,
+			.height = vk.swapchain_extent.height,
+			.depth = 1,
+		},
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = vk.sample_count,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	}, 0, &vk.multisampled_color_image));
+
+	VkMemoryRequirements multisampled_color_image_memory_requirements;
+	vkGetImageMemoryRequirements(vk.device, vk.multisampled_color_image,
+		&multisampled_color_image_memory_requirements);
+
+	u32 memory_type_index = ~(u32) 0;
+	VkMemoryPropertyFlags requested_properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	for (u32 i = 0; i < physical_device_memory_properties.memoryTypeCount; ++i) {
+		if ((multisampled_color_image_memory_requirements.memoryTypeBits & ((u32) 1 << i)) &&
+			(physical_device_memory_properties.memoryTypes[i].propertyFlags & requested_properties) == requested_properties) {
+				memory_type_index = i;
+				break;
+		}
+	}
+	VK_ASSERT(memory_type_index != ~(u32) 0);
+
+	VK_CHECK(vkAllocateMemory(vk.device, &(VkMemoryAllocateInfo) {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = multisampled_color_image_memory_requirements.size,
+		.memoryTypeIndex = memory_type_index,
+	}, 0, &vk.multisampled_color_image_memory));
+
+	VK_CHECK(vkBindImageMemory(vk.device, vk.multisampled_color_image,
+		vk.multisampled_color_image_memory, 0));
+
+	VK_CHECK(vkCreateImageView(vk.device, &(VkImageViewCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = vk.multisampled_color_image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = vk.swapchain_format.format,
+		.subresourceRange = (VkImageSubresourceRange) {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.levelCount = 1,
+			.layerCount = 1,
+		},
+	}, 0, &vk.multisampled_color_image_view));
 
 	VK_CHECK(vkCreateSwapchainKHR(vk.device, &(VkSwapchainCreateInfoKHR) {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -172,8 +233,8 @@ static void swapchain_init(void) {
 		VK_CHECK(vkCreateFramebuffer(vk.device, &(VkFramebufferCreateInfo) {
 			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 			.renderPass = vk.main_render_pass,
-			.attachmentCount = 1,
-			.pAttachments = (VkImageView []) {vk.swapchain_image_views[i]},
+			.attachmentCount = 2,
+			.pAttachments = (VkImageView []) {vk.multisampled_color_image_view, vk.swapchain_image_views[i]},
 			.width = vk.swapchain_extent.width,
 			.height = vk.swapchain_extent.height,
 			.layers = 1,
@@ -189,11 +250,16 @@ static void swapchain_deinit(void) {
 	vkDeviceWaitIdle(vk.device);
 	if (vk.swapchain) {
 		for (u32 i = 0; i < vk.swapchain_image_count; ++i) {
-			vkDestroyFramebuffer(vk.device, vk.swapchain_framebuffers[i], 0);
-			vkDestroyImageView(vk.device, vk.swapchain_image_views[i], 0);
+			if (vk.swapchain_framebuffers[i]) vkDestroyFramebuffer(vk.device, vk.swapchain_framebuffers[i], 0);
+			if (vk.swapchain_image_views[i]) vkDestroyImageView(vk.device, vk.swapchain_image_views[i], 0);
 		}
+
 		vkDestroySwapchainKHR(vk.device, vk.swapchain, 0);
 	}
+
+	if (vk.multisampled_color_image_view) vkDestroyImageView(vk.device, vk.multisampled_color_image_view, 0);
+	if (vk.multisampled_color_image_memory) vkFreeMemory(vk.device, vk.multisampled_color_image_memory, 0);
+	if (vk.multisampled_color_image) vkDestroyImage(vk.device, vk.multisampled_color_image, 0);
 }
 
 static void swapchain_reinit(void) {
@@ -316,6 +382,16 @@ static void vulkan_init(void) {
 		.queueFamilyIndex = vk.graphics_queue_family_index,
 	}, 0, &vk.graphics_command_pool));
 
+	VkSampleCountFlags supported_counts =
+		physical_device_properties.limits.framebufferColorSampleCounts &
+		physical_device_properties.limits.framebufferDepthSampleCounts;
+	vk.sample_count = VK_SAMPLE_COUNT_1_BIT;
+	for (VkFlags count = VK_SAMPLE_COUNT_64_BIT; count > VK_SAMPLE_COUNT_1_BIT; count >>= 1) {
+		if (supported_counts & count) {
+			vk.sample_count = count;
+			break;
+		}
+	}
 
 	VkSurfaceFormatKHR surface_formats[16];
 	u32 surface_formats_count = LENGTH(surface_formats);
@@ -335,12 +411,20 @@ static void vulkan_init(void) {
 
 	VK_CHECK(vkCreateRenderPass(vk.device, &(VkRenderPassCreateInfo) {
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.attachmentCount = 1,
+		.attachmentCount = 2,
 		.pAttachments = (VkAttachmentDescription []) {
 			{
 				.format = vk.swapchain_format.format,
-				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.samples = vk.sample_count,
 				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			},
+			{
+				.format = vk.swapchain_format.format,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -354,6 +438,12 @@ static void vulkan_init(void) {
 				.pColorAttachments = (VkAttachmentReference []) {
 					{
 						.attachment = 0,
+						.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					},
+				},
+				.pResolveAttachments = (VkAttachmentReference []) {
+					{
+						.attachment = 1,
 						.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 					},
 				},
